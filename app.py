@@ -94,48 +94,103 @@ def _plot_series(result) -> go.Figure:
     return fig
 
 
-def _plot_distribution(result) -> go.Figure:
-    fig = make_subplots(rows=1, cols=2, subplot_titles=("Value distribution", "Residuals pool"))
+COLORS = {
+    "generated": "#c45c26",
+    "observed": "#1f4e79",
+    "complete": "#2f6f4e",
+}
 
-    fig.add_trace(
-        go.Histogram(
-            x=result.generated.values,
-            name="Generated",
-            opacity=0.65,
-            marker_color="#c45c26",
-            nbinsx=40,
+
+def _five_day_increments(values: pd.Series | np.ndarray) -> np.ndarray:
+    """Δ over 5 steps (one business week on a weekday calendar)."""
+    s = pd.Series(np.asarray(values, dtype=float))
+    return s.diff(5).dropna().to_numpy()
+
+
+def _overlay_histograms(
+    fig: go.Figure,
+    series_map: dict[str, np.ndarray],
+    *,
+    row: int,
+    col: int,
+    nbinsx: int = 40,
+    showlegend: bool = True,
+) -> None:
+    for name, values in series_map.items():
+        if values is None or len(values) == 0:
+            continue
+        fig.add_trace(
+            go.Histogram(
+                x=values,
+                name=name,
+                opacity=0.55,
+                marker_color=COLORS.get(name.lower(), None),
+                nbinsx=nbinsx,
+                legendgroup=name,
+                showlegend=showlegend,
+            ),
+            row=row,
+            col=col,
+        )
+
+
+def _plot_distribution(result) -> go.Figure:
+    complete = result.series.to_numpy(dtype=float)
+    generated = result.generated.to_numpy(dtype=float)
+    observed = result.observed.to_numpy(dtype=float)
+
+    value_map = {
+        "Generated": generated,
+        "Observed": observed,
+        "Complete": complete,
+    }
+    incr_map = {
+        "Generated": _five_day_increments(generated),
+        "Observed": _five_day_increments(observed),
+        "Complete": _five_day_increments(complete),
+    }
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=(
+            "Value distribution",
+            "5-day increment distribution",
         ),
-        row=1,
-        col=1,
     )
-    fig.add_trace(
-        go.Histogram(
-            x=result.observed.values,
-            name="Observed",
-            opacity=0.55,
-            marker_color="#1f4e79",
-            nbinsx=40,
-        ),
-        row=1,
-        col=1,
+    _overlay_histograms(fig, value_map, row=1, col=1, showlegend=True)
+    _overlay_histograms(fig, incr_map, row=1, col=2, showlegend=False)
+
+    fig.update_layout(
+        barmode="overlay",
+        height=400,
+        margin=dict(l=20, r=20, t=50, b=20),
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.14, x=0),
     )
-    fig.add_trace(
+    fig.update_xaxes(title_text="Value", row=1, col=1)
+    fig.update_xaxes(title_text="Δ over 5 steps", row=1, col=2)
+    fig.update_yaxes(title_text="Count", row=1, col=1)
+    return fig
+
+
+def _plot_residuals(result) -> go.Figure:
+    fig = go.Figure(
         go.Histogram(
-            x=result.residuals_pool.dropna().values,
+            x=result.residuals_pool.dropna().to_numpy(),
             name="Residuals",
             marker_color="#5a7d5a",
             nbinsx=40,
-            showlegend=False,
-        ),
-        row=1,
-        col=2,
+        )
     )
     fig.update_layout(
-        barmode="overlay",
-        height=360,
-        margin=dict(l=20, r=20, t=50, b=20),
+        height=280,
+        margin=dict(l=20, r=20, t=40, b=20),
         template="plotly_white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.12, x=0),
+        title="STL residuals pool (observed)",
+        xaxis_title="Residual",
+        yaxis_title="Count",
+        showlegend=False,
     )
     return fig
 
@@ -312,7 +367,13 @@ def main() -> None:
     st.plotly_chart(_plot_series(result), use_container_width=True)
 
     st.subheader("Distribution check")
+    st.caption(
+        "Compare **Generated**, **Observed**, and **Complete** (Generated + Observed) "
+        "for levels and for 5-step increments (one business week on a weekday calendar)."
+    )
     st.plotly_chart(_plot_distribution(result), use_container_width=True)
+    with st.expander("STL residuals pool"):
+        st.plotly_chart(_plot_residuals(result), use_container_width=True)
 
     out = _result_frame(result)
     st.subheader("Download")
