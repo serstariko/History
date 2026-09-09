@@ -36,12 +36,37 @@ class BackfillResult:
     n_generated: int
 
 
-def _infer_freq(index: pd.DatetimeIndex) -> str:
+def _weekend_share(index: pd.DatetimeIndex) -> float:
+    if len(index) == 0:
+        return 0.0
+    return float((index.dayofweek >= 5).mean())
+
+
+def _looks_like_business_days(index: pd.DatetimeIndex) -> bool:
+    """True when the series is almost entirely Mon–Fri."""
+    if len(index) < 5:
+        return False
+    if _weekend_share(index) > 0.02:
+        return False
+    # Median gap should be ~1 calendar day (Fri→Mon is 3, but median is 1)
+    deltas = pd.Series(index).diff().dropna().dt.days
+    if deltas.empty:
+        return False
+    return float(deltas.median()) <= 1.5
+
+
+def _infer_freq(index: pd.DatetimeIndex, *, weekdays_only: bool = False) -> str:
     if len(index) < 2:
         raise ValueError("Need at least 2 observations to infer frequency.")
 
+    if weekdays_only or _looks_like_business_days(index):
+        return "B"
+
     inferred = pd.infer_freq(index)
     if inferred:
+        # Normalize business-day aliases
+        if inferred.upper().startswith("B"):
+            return "B"
         return inferred
 
     deltas = pd.Series(index[1:]).diff().dropna().dt.total_seconds()
@@ -69,6 +94,11 @@ def _season_period_for_freq(freq: str, index: pd.DatetimeIndex) -> int:
     f = freq.upper()
     if f.startswith("H"):
         return 24
+    if f.startswith("B"):
+        # ~252 trading days / year; else Mon–Fri weekly cycle.
+        if len(index) >= 2 * 252:
+            return 252
+        return 5
     if f.startswith("D"):
         # Prefer annual seasonality when the history is long enough for STL.
         if len(index) >= 2 * 365:
@@ -87,15 +117,35 @@ def _season_period_for_freq(freq: str, index: pd.DatetimeIndex) -> int:
     return max(2, min(12, len(index) // 3))
 
 
+def _to_business_day(ts: pd.Timestamp, *, side: str = "forward") -> pd.Timestamp:
+    """Snap a timestamp onto a weekday."""
+    ts = pd.Timestamp(ts).normalize()
+    if ts.dayofweek < 5:
+        return ts
+    bday = pd.offsets.BDay()
+    if side == "backward":
+        return bday.rollback(ts)
+    return bday.rollforward(ts)
+
+
 def _make_full_index(
     start: pd.Timestamp,
     end: pd.Timestamp,
     freq: str,
 ) -> pd.DatetimeIndex:
-    idx = pd.date_range(start=start, end=end, freq=freq)
+    if freq.upper().startswith("B"):
+        start = _to_business_day(start, side="forward")
+        end = _to_business_day(end, side="backward")
+        idx = pd.bdate_range(start=start, end=end)
+    else:
+        idx = pd.date_range(start=start, end=end, freq=freq)
     if len(idx) == 0:
         raise ValueError("Empty date range for the requested start/end.")
     return idx
+
+
+def _drop_weekends(series: pd.Series) -> pd.Series:
+    return series[series.index.dayofweek < 5]
 
 
 def _seasonal_means(values: pd.Series, period: int) -> pd.Series:
@@ -225,6 +275,7 @@ def backfill_series(
     block_size: Optional[int] = None,
     blend_len: Optional[int] = None,
     freq: Optional[str] = None,
+    weekdays_only: bool = True,
     random_state: Optional[int] = 42,
 ) -> BackfillResult:
     """
@@ -245,7 +296,11 @@ def backfill_series(
     blend_len :
         Points used to blend the seam. Defaults to ``max(1, season_period // 4)``.
     freq :
-        Pandas offset alias. Inferred if omitted.
+        Pandas offset alias. Inferred if omitted. Forced to ``B`` when
+        ``weekdays_only`` is True.
+    weekdays_only :
+        If True (default), keep only Monday–Friday: weekends are dropped from
+        the input and never generated in the output.
     random_state :
         RNG seed for reproducibility.
     """
@@ -256,12 +311,19 @@ def backfill_series(
     if y.index.has_duplicates:
         y = y[~y.index.duplicated(keep="first")]
 
+    if weekdays_only:
+        y = _drop_weekends(y)
+
     if len(y) < 4:
         raise ValueError("Need at least 4 observed points.")
 
-    desired_start = pd.Timestamp(desired_start)
-    observed_start = pd.Timestamp(y.index[0])
-    observed_end = pd.Timestamp(y.index[-1])
+    desired_start = pd.Timestamp(desired_start).normalize()
+    observed_start = pd.Timestamp(y.index[0]).normalize()
+    observed_end = pd.Timestamp(y.index[-1]).normalize()
+
+    if weekdays_only:
+        desired_start = _to_business_day(desired_start, side="forward")
+        # observed endpoints are already weekdays after filtering
 
     if desired_start >= observed_start:
         raise ValueError(
@@ -272,7 +334,11 @@ def backfill_series(
     if model == "multiplicative" and (y <= 0).any():
         raise ValueError("Multiplicative model requires strictly positive values.")
 
-    freq = freq or _infer_freq(y.index)
+    if weekdays_only:
+        freq = "B"
+    else:
+        freq = freq or _infer_freq(y.index, weekdays_only=False)
+
     period = season_period or _season_period_for_freq(freq, y.index)
     period = max(2, int(period))
     block_size = int(block_size) if block_size else period
@@ -281,7 +347,13 @@ def backfill_series(
 
     full_index = _make_full_index(desired_start, observed_end, freq)
     y_grid = y.reindex(full_index)
-    n_back = int(full_index.get_indexer([observed_start])[0])
+
+    # Locate first observed point on the calendar grid
+    loc = full_index.get_indexer([observed_start], method=None)[0]
+    if loc < 0:
+        # Fallback: first grid timestamp on/after observed_start
+        loc = int(full_index.searchsorted(observed_start))
+    n_back = int(loc)
     if n_back <= 0:
         raise ValueError(
             "No missing prefix on the inferred calendar. "

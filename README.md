@@ -5,6 +5,7 @@ Generate a missing **prefix** of a time series while preserving seasonal structu
 ## Method
 
 1. Infer calendar frequency and align the series to a regular index from the desired start date.
+   **Weekdays-only mode (default):** use a business-day calendar (`B`); weekends are dropped from the input and never generated.
 2. Decompose the observed part with **STL** (trend + seasonal + residual). Multiplicative mode works in log-space.
 3. Extrapolate the trend backward with a local linear fit.
 4. Replay the average seasonal profile.
@@ -41,6 +42,7 @@ result = backfill_series(
     series,
     desired_start="2016-01-01",
     model="additive",
+    weekdays_only=True,  # default: Mon–Fri only
     random_state=42,
 )
 
@@ -51,11 +53,13 @@ print(result.n_generated, result.freq, result.season_period)
 ## Sample data
 
 ```bash
-python generate_sample.py   # writes sample_data.csv (daily, 2017–2025)
+python generate_sample.py   # writes sample_data.csv (weekdays, 2017–2025)
 ```
 
 ## Notes
 
-- The series should be roughly regularly spaced (daily / weekly / monthly, …).
+- By default only **Monday–Friday** values are kept/generated (`weekdays_only=True`).
+- If `desired_start` falls on a weekend, it is snapped to the next weekday.
+- The series should be roughly regularly spaced (business-daily / daily / weekly / monthly, …).
 - `desired_start` must be earlier than the first observed timestamp.
 - Multiplicative mode requires strictly positive values.

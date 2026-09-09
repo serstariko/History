@@ -22,14 +22,17 @@ st.set_page_config(
 
 
 def _demo_series() -> pd.DataFrame:
-    """Synthetic daily series with ~9 years of history (missing first year of a 10y window)."""
+    """Synthetic weekday series (~9y), missing the first year of a 10y window."""
     rng = np.random.default_rng(7)
-    idx = pd.date_range("2017-01-01", "2025-12-31", freq="D")
+    idx = pd.bdate_range("2017-01-01", "2025-12-31")
     t = np.arange(len(idx))
-    trend = 100 + 0.01 * t
-    seasonal = 8 * np.sin(2 * np.pi * t / 365.25) + 3 * np.sin(2 * np.pi * t / 7)
+    trend = 100 + 0.012 * t
+    # Annual + Mon–Fri patterns on a business-day index
+    seasonal = (
+        8 * np.sin(2 * np.pi * t / 252)
+        + 3 * np.sin(2 * np.pi * t / 5)
+    )
     noise = rng.normal(0, 2.5, size=len(idx))
-    # mild AR noise
     for i in range(1, len(noise)):
         noise[i] = 0.4 * noise[i - 1] + noise[i]
     values = trend + seasonal + noise
@@ -141,7 +144,8 @@ def main() -> None:
     st.title("Time Series Backfill")
     st.caption(
         "Generate a missing prefix while preserving seasonal structure and the "
-        "historical residual distribution (STL + seasonal block bootstrap)."
+        "historical residual distribution (STL + seasonal block bootstrap). "
+        "By default only weekdays (Mon–Fri) are kept and generated."
     )
 
     with st.sidebar:
@@ -152,16 +156,27 @@ def main() -> None:
             uploaded = st.file_uploader("CSV file", type=["csv"])
 
         st.header("Backfill settings")
+        weekdays_only = st.toggle(
+            "Weekdays only (Mon–Fri)",
+            value=True,
+            help="Drop weekends from the input and generate values only for business days.",
+        )
         model = st.selectbox("Model", ["additive", "multiplicative"])
         auto_period = st.toggle("Auto season period", value=True)
         season_period = None
         if not auto_period:
-            season_period = st.number_input("Season period", min_value=2, value=7, step=1)
+            default_period = 5 if weekdays_only else 7
+            season_period = st.number_input(
+                "Season period", min_value=2, value=default_period, step=1
+            )
 
         auto_block = st.toggle("Auto block size", value=True)
         block_size = None
         if not auto_block:
-            block_size = st.number_input("Bootstrap block size", min_value=1, value=7, step=1)
+            default_block = 5 if weekdays_only else 7
+            block_size = st.number_input(
+                "Bootstrap block size", min_value=1, value=default_block, step=1
+            )
 
         blend_len = st.number_input(
             "Seam blend length (0 = off)",
@@ -176,8 +191,9 @@ def main() -> None:
     if use_demo:
         raw = _demo_series()
         st.info(
-            "Demo: daily series from **2017-01-01**. "
-            "Try desired start **2016-01-01** to synthesize the missing first year."
+            "Demo: **weekday** series from **2017-01-03** (first business day). "
+            "Try desired start **2016-01-01** to synthesize the missing first year "
+            "(weekends are skipped)."
         )
     elif uploaded is not None:
         raw = pd.read_csv(uploaded)
@@ -231,8 +247,9 @@ def main() -> None:
         "Desired series start date",
         value=default_desired,
         max_value=obs_start - timedelta(days=1),
-        help="The completed series will begin on this date. "
-        "The gap until the first observed date will be generated.",
+        help="The completed series will begin on this date (or the next weekday "
+        "if weekdays-only mode is on). The gap until the first observed date "
+        "will be generated.",
     )
 
     run = st.button("Generate missing prefix", type="primary", use_container_width=False)
@@ -271,6 +288,7 @@ def main() -> None:
                 season_period=int(season_period) if season_period else None,
                 block_size=int(block_size) if block_size else None,
                 blend_len=blend_arg,
+                weekdays_only=bool(weekdays_only),
                 random_state=int(random_state),
             )
         except Exception as exc:
@@ -282,6 +300,13 @@ def main() -> None:
     m2.metric("Frequency", result.freq)
     m3.metric("Season period", result.season_period)
     m4.metric("Model", result.model)
+
+    if weekdays_only:
+        weekend_count = int((result.series.index.dayofweek >= 5).sum())
+        st.caption(
+            f"Weekdays-only mode: output has **{weekend_count}** weekend rows "
+            f"(expected 0)."
+        )
 
     st.subheader("Completed series")
     st.plotly_chart(_plot_series(result), use_container_width=True)
@@ -306,7 +331,8 @@ def main() -> None:
     with st.expander("Method"):
         st.markdown(
             """
-1. Infer calendar frequency and build a regular index from the desired start.
+1. Build a regular calendar from the desired start (**business days** when
+   weekdays-only mode is on — weekends are dropped and never generated).
 2. Decompose the observed part with **STL** (trend + seasonal + residual).
 3. Extrapolate the **trend** backward with a local linear fit.
 4. Replay the average **seasonal** profile.
